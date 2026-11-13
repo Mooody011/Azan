@@ -1,1 +1,842 @@
+name: Build Athan Android APK
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: 'stable'
+          cache: true
+
+      - name: Create Clean Flutter Project
+        run: |
+          rm -rf android ios lib test pubspec.yaml pubspec.lock
+          flutter create --org com.mohamed.athan --project-name athan_app .
+
+      - name: Add Dependencies
+        run: |
+          flutter pub add adhan:^2.0.0+1 intl:^0.19.0 geolocator:^13.0.1 flutter_local_notifications:^17.2.3 timezone:^0.9.4 shared_preferences:^2.3.2
+
+      - name: Configure Android Permissions, Gradle & Embedded Athan Sound
+        run: |
+          python3 - << 'EOF'
+          import os, wave, math, struct
+
+          # 1. توليد ملف صوت تنبيه/أذان مدمج داخل res/raw/athan.wav
+          raw_dir = "android/app/src/main/res/raw"
+          os.makedirs(raw_dir, exist_ok=True)
+          wav_path = os.path.join(raw_dir, "athan.wav")
+          sample_rate = 44100
+          notes = [(523.25, 0.7), (659.25, 0.7), (783.99, 0.9), (659.25, 0.6), (523.25, 1.1)]
+          with wave.open(wav_path, "w") as wf:
+              wf.setnchannels(1)
+              wf.setsampwidth(2)
+              wf.setframerate(sample_rate)
+              for freq, dur in notes:
+                  total = int(sample_rate * dur)
+                  for i in range(total):
+                      t = i / sample_rate
+                      env = min(1.0, t / 0.05) * max(0.0, 1.0 - (t / dur) * 0.7)
+                      val = 0.5 * math.sin(2 * math.pi * freq * t) + 0.25 * math.sin(2 * math.pi * freq * 2 * t)
+                      sample = int(val * env * 28000)
+                      wf.writeframes(struct.pack("<h", max(-32768, min(32767, sample))))
+
+          # 2. تحديث android/app/build.gradle لتفعيل Desugaring وضبط SDK
+          gradle_path = "android/app/build.gradle"
+          with open(gradle_path, "r", encoding="utf-8") as f:
+              gradle = f.read()
+
+          gradle = gradle.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 34")
+          gradle = gradle.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 34")
+          gradle = gradle.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
+          gradle = gradle.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
+          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled true")
+          gradle += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+
+          with open(gradle_path, "w", encoding="utf-8") as f:
+              f.write(gradle)
+
+          # 3. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
+          manifest_path = "android/app/src/main/AndroidManifest.xml"
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = f.read()
+
+          permissions = """    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <application"""
+
+          receivers = """        <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+                  <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                      </intent-filter>
+                  </receiver>
+              </application>"""
+
+          manifest = manifest.replace("<application", permissions, 1)
+          manifest = manifest.replace("</application>", receivers, 1)
+          manifest = manifest.replace('android:label="athan_app"', 'android:label="مواقيت الصلاة"')
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(manifest)
+          EOF
+
+      - name: Write Flutter App Code
+        run: |
+          cat << 'EOF' > lib/main.dart
+          import 'dart:async';
+          import 'dart:math' as math;
+          import 'package:adhan/adhan.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+          import 'package:geolocator/geolocator.dart';
+          import 'package:intl/intl.dart' hide TextDirection;
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:timezone/data/latest_all.dart' as tz;
+          import 'package:timezone/timezone.dart' as tz;
+
+          final FlutterLocalNotificationsPlugin notificationsPlugin =
+              FlutterLocalNotificationsPlugin();
+
+          void _configureLocalTimeZone() {
+            tz.initializeTimeZones();
+            final offsetMs = DateTime.now().timeZoneOffset.inMilliseconds;
+            final cairo = tz.getLocation('Africa/Cairo');
+            if (cairo.currentTimeZone.offset == offsetMs) {
+              tz.setLocalLocation(cairo);
+              return;
+            }
+            for (final location in tz.timeZoneDatabase.locations.values) {
+              if (location.currentTimeZone.offset == offsetMs) {
+                tz.setLocalLocation(location);
+                return;
+              }
+            }
+          }
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            _configureLocalTimeZone();
+
+            const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+            const initSettings = InitializationSettings(android: androidInit);
+            await notificationsPlugin.initialize(initSettings);
+
+            runApp(const AthanApp());
+          }
+
+          class AthanApp extends StatelessWidget {
+            const AthanApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'مواقيت الصلاة',
+                theme: ThemeData(
+                  useMaterial3: true,
+                  brightness: Brightness.dark,
+                  scaffoldBackgroundColor: const Color(0xFF0B1914),
+                  colorScheme: const ColorScheme.dark(
+                    primary: Color(0xFFD4AF37),
+                    secondary: Color(0xFF1B4332),
+                    surface: Color(0xFF12261F),
+                  ),
+                ),
+                home: const Directionality(
+                  textDirection: TextDirection.rtl,
+                  child: MainScreen(),
+                ),
+              );
+            }
+          }
+
+          class MainScreen extends StatefulWidget {
+            const MainScreen({super.key});
+
+            @override
+            State<MainScreen> createState() => _MainScreenState();
+          }
+
+          class _MainScreenState extends State<MainScreen> {
+            int _selectedIndex = 0;
+
+            // الإحداثيات الافتراضية (القاهرة / الجيزة - مصر)
+            double _lat = 30.0444;
+            double _lng = 31.2357;
+            String _locationName = 'القاهرة، مصر';
+            String _methodKey = 'egyptian';
+            bool _notificationsEnabled = true;
+            bool _loadingLocation = false;
+
+            PrayerTimes? _prayerTimes;
+            DateTime? _nextPrayerTime;
+            String _nextPrayerName = '';
+            Duration _remaining = Duration.zero;
+            Timer? _timer;
+
+            int _tasbihCount = 0;
+            int _tasbihIndex = 0;
+            final List<String> _tasbihList = [
+              'سبحان الله',
+              'الحمد لله',
+              'الله أكبر',
+              'لا إله إلا الله',
+              'أستغفر الله العظيم',
+              'اللهم صلِّ وسلم على نبينا محمد',
+            ];
+
+            @override
+            void initState() {
+              super.initState();
+              _initApp();
+            }
+
+            Future<void> _initApp() async {
+              await _loadPrefs();
+              await _requestNotificationPermissions();
+              _calculatePrayers();
+              _startCountdown();
+            }
+
+            Future<void> _loadPrefs() async {
+              final prefs = await SharedPreferences.getInstance();
+              setState(() {
+                _lat = prefs.getDouble('lat') ?? 30.0444;
+                _lng = prefs.getDouble('lng') ?? 31.2357;
+                _locationName = prefs.getString('loc_name') ?? 'القاهرة، مصر';
+                _methodKey = prefs.getString('method') ?? 'egyptian';
+                _notificationsEnabled = prefs.getBool('notif') ?? true;
+                _tasbihCount = prefs.getInt('tasbih') ?? 0;
+              });
+            }
+
+            Future<void> _savePrefs() async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setDouble('lat', _lat);
+              await prefs.setDouble('lng', _lng);
+              await prefs.setString('loc_name', _locationName);
+              await prefs.setString('method', _methodKey);
+              await prefs.setBool('notif', _notificationsEnabled);
+              await prefs.setInt('tasbih', _tasbihCount);
+            }
+
+            Future<void> _requestNotificationPermissions() async {
+              final androidImpl = notificationsPlugin
+                  .resolvePlatformSpecificImplementation<
+                      AndroidFlutterLocalNotificationsPlugin>();
+              await androidImpl?.requestNotificationsPermission();
+              await androidImpl?.requestExactAlarmsPermission();
+            }
+
+            CalculationParameters _getCalculationParams() {
+              CalculationParameters params;
+              switch (_methodKey) {
+                case 'umm_al_qura':
+                  params = CalculationMethod.umm_al_qura.getParameters();
+                  break;
+                case 'mwl':
+                  params = CalculationMethod.muslim_world_league.getParameters();
+                  break;
+                case 'dubai':
+                  params = CalculationMethod.dubai.getParameters();
+                  break;
+                case 'egyptian':
+                default:
+                  params = CalculationMethod.egyptian.getParameters();
+                  break;
+              }
+              params.madhab = Madhab.shafi;
+              return params;
+            }
+
+            void _calculatePrayers() {
+              final coords = Coordinates(_lat, _lng);
+              final params = _getCalculationParams();
+              final todayPrayers = PrayerTimes.today(coords, params);
+
+              final next = todayPrayers.nextPrayer();
+              DateTime? nextTime;
+              String nextName = '';
+
+              if (next == Prayer.none) {
+                final tomorrow = DateTime.now().add(const Duration(days: 1));
+                final tomorrowPrayers =
+                    PrayerTimes(coords, DateComponents.from(tomorrow), params);
+                nextTime = tomorrowPrayers.fajr;
+                nextName = 'الفجر';
+              } else {
+                nextTime = todayPrayers.timeForPrayer(next);
+                nextName = _prayerArabicName(next);
+              }
+
+              setState(() {
+                _prayerTimes = todayPrayers;
+                _nextPrayerTime = nextTime;
+                _nextPrayerName = nextName;
+                if (nextTime != null) {
+                  _remaining = nextTime.difference(DateTime.now());
+                }
+              });
+
+              _scheduleAllNotifications(todayPrayers);
+            }
+
+            String _prayerArabicName(Prayer p) {
+              switch (p) {
+                case Prayer.fajr:
+                  return 'الفجر';
+                case Prayer.sunrise:
+                  return 'الشروق';
+                case Prayer.dhuhr:
+                  return 'الظهر';
+                case Prayer.asr:
+                  return 'العصر';
+                case Prayer.maghrib:
+                  return 'المغرب';
+                case Prayer.isha:
+                  return 'العشاء';
+                case Prayer.none:
+                  return 'الفجر';
+              }
+            }
+
+            Future<void> _scheduleAllNotifications(PrayerTimes prayers) async {
+              await notificationsPlugin.cancelAll();
+              if (!_notificationsEnabled) return;
+
+              final items = <Map<String, dynamic>>[
+                {'id': 1, 'name': 'الفجر', 'time': prayers.fajr},
+                {'id': 2, 'name': 'الظهر', 'time': prayers.dhuhr},
+                {'id': 3, 'name': 'العصر', 'time': prayers.asr},
+                {'id': 4, 'name': 'المغرب', 'time': prayers.maghrib},
+                {'id': 5, 'name': 'العشاء', 'time': prayers.isha},
+              ];
+
+              final now = DateTime.now();
+              for (final item in items) {
+                DateTime time = item['time'] as DateTime;
+                if (time.isBefore(now)) {
+                  time = time.add(const Duration(days: 1));
+                }
+
+                await notificationsPlugin.zonedSchedule(
+                  item['id'] as int,
+                  'حان الآن موعد أذان ${item['name']}',
+                  'حيّ على الصلاة.. حيّ على الفلاح',
+                  tz.TZDateTime.from(time, tz.local),
+                  const NotificationDetails(
+                    android: AndroidNotificationDetails(
+                      'athan_channel_v1',
+                      'تنبيهات الأذان',
+                      channelDescription: 'إشعارات مواقيت الصلاة والأذان',
+                      importance: Importance.max,
+                      priority: Priority.high,
+                      sound: RawResourceAndroidNotificationSound('athan'),
+                      playSound: true,
+                      enableVibration: true,
+                    ),
+                  ),
+                  androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+                  uiLocalNotificationDateInterpretation:
+                      UILocalNotificationDateInterpretation.absoluteTime,
+                );
+              }
+            }
+
+            Future<void> _testNotification() async {
+              await notificationsPlugin.show(
+                99,
+                'تجربة تنبيه الأذان',
+                'صوت وإشعار الأذان يعملان بنجاح',
+                const NotificationDetails(
+                  android: AndroidNotificationDetails(
+                    'athan_channel_v1',
+                    'تنبيهات الأذان',
+                    channelDescription: 'إشعارات مواقيت الصلاة والأذان',
+                    importance: Importance.max,
+                    priority: Priority.high,
+                    sound: RawResourceAndroidNotificationSound('athan'),
+                    playSound: true,
+                    enableVibration: true,
+                  ),
+                ),
+              );
+            }
+
+            void _startCountdown() {
+              _timer?.cancel();
+              _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+                if (_nextPrayerTime == null) return;
+                final diff = _nextPrayerTime!.difference(DateTime.now());
+                if (diff.isNegative) {
+                  _calculatePrayers();
+                } else {
+                  setState(() {
+                    _remaining = diff;
+                  });
+                }
+              });
+            }
+
+            Future<void> _updateLocationGPS() async {
+              setState(() => _loadingLocation = true);
+              try {
+                bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+                if (!serviceEnabled) {
+                  _showSnack('برجاء تفعيل GPS في الهاتف أولاً');
+                  return;
+                }
+                LocationPermission permission = await Geolocator.checkPermission();
+                if (permission == LocationPermission.denied) {
+                  permission = await Geolocator.requestPermission();
+                }
+                if (permission == LocationPermission.denied ||
+                    permission == LocationPermission.deniedForever) {
+                  _showSnack('تم رفض صلاحية تحديد الموقع');
+                  return;
+                }
+                final pos = await Geolocator.getCurrentPosition();
+                setState(() {
+                  _lat = pos.latitude;
+                  _lng = pos.longitude;
+                  _locationName =
+                      'موقعك الحالي (${_lat.toStringAsFixed(2)}, ${_lng.toStringAsFixed(2)})';
+                });
+                await _savePrefs();
+                _calculatePrayers();
+                _showSnack('تم تحديث المواقيت حسب موقعك الحالي');
+              } catch (e) {
+                _showSnack('تعذر تحديد الموقع: $e');
+              } finally {
+                if (mounted) setState(() => _loadingLocation = false);
+              }
+            }
+
+            void _showSnack(String msg) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text(msg)),
+              );
+            }
+
+            String _formatDuration(Duration d) {
+              final h = d.inHours.toString().padLeft(2, '0');
+              final m = (d.inMinutes % 60).toString().padLeft(2, '0');
+              final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+              return '$h:$m:$s';
+            }
+
+            String _formatTime(DateTime? dt) {
+              if (dt == null) return '--:--';
+              return DateFormat('hh:mm a').format(dt);
+            }
+
+            @override
+            void dispose() {
+              _timer?.cancel();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final pages = [
+                _buildPrayersTab(),
+                _buildQiblaAndTasbihTab(),
+                _buildSettingsTab(),
+              ];
+
+              return Scaffold(
+                appBar: AppBar(
+                  backgroundColor: const Color(0xFF0F241D),
+                  title: const Text(
+                    'مواقيت الصلاة والأذان',
+                    style: TextStyle(
+                      color: Color(0xFFD4AF37),
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  actions: [
+                    IconButton(
+                      tooltip: 'تجربة صوت الأذان',
+                      icon: const Icon(Icons.notifications_active,
+                          color: Color(0xFFD4AF37)),
+                      onPressed: _testNotification,
+                    ),
+                    IconButton(
+                      tooltip: 'تحديث الموقع GPS',
+                      icon: _loadingLocation
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.my_location, color: Color(0xFFD4AF37)),
+                      onPressed: _loadingLocation ? null : _updateLocationGPS,
+                    ),
+                  ],
+                ),
+                body: pages[_selectedIndex],
+                bottomNavigationBar: NavigationBar(
+                  backgroundColor: const Color(0xFF0F241D),
+                  selectedIndex: _selectedIndex,
+                  onDestinationSelected: (i) => setState(() => _selectedIndex = i),
+                  destinations: const [
+                    NavigationDestination(
+                      icon: Icon(Icons.access_time),
+                      label: 'المواقيت',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.explore),
+                      label: 'القبلة والسبحة',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.settings),
+                      label: 'الإعدادات',
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Widget _buildPrayersTab() {
+              final p = _prayerTimes;
+              if (p == null) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              final current = p.currentPrayer();
+              final rows = [
+                {'prayer': Prayer.fajr, 'name': 'الفجر', 'time': p.fajr, 'icon': Icons.wb_twilight},
+                {'prayer': Prayer.sunrise, 'name': 'الشروق', 'time': p.sunrise, 'icon': Icons.wb_sunny_outlined},
+                {'prayer': Prayer.dhuhr, 'name': 'الظهر', 'time': p.dhuhr, 'icon': Icons.wb_sunny},
+                {'prayer': Prayer.asr, 'name': 'العصر', 'time': p.asr, 'icon': Icons.sunny_snowing},
+                {'prayer': Prayer.maghrib, 'name': 'المغرب', 'time': p.maghrib, 'icon': Icons.nights_stay_outlined},
+                {'prayer': Prayer.isha, 'name': 'العشاء', 'time': p.isha, 'icon': Icons.nightlight_round},
+              ];
+
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF1B4332), Color(0xFF0E2920)],
+                        begin: Alignment.topRight,
+                        end: Alignment.bottomLeft,
+                      ),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: const Color(0xFFD4AF37).withOpacity(0.5),
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(Icons.location_on,
+                                size: 16, color: Color(0xFFD4AF37)),
+                            const SizedBox(width: 4),
+                            Text(
+                              _locationName,
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'الصلاة القادمة: $_nextPrayerName',
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFD4AF37),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          _formatDuration(_remaining),
+                          style: const TextStyle(
+                            fontSize: 38,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          DateFormat('EEEE، d MMMM y').format(DateTime.now()),
+                          style: const TextStyle(color: Colors.white60, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  ...rows.map((item) {
+                    final isCurrent = item['prayer'] == current;
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      padding:
+                          const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+                      decoration: BoxDecoration(
+                        color: isCurrent
+                            ? const Color(0xFF1D4A38)
+                            : const Color(0xFF12261F),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: isCurrent
+                              ? const Color(0xFFD4AF37)
+                              : Colors.white10,
+                          width: isCurrent ? 1.5 : 1,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            item['icon'] as IconData,
+                            color: isCurrent
+                                ? const Color(0xFFD4AF37)
+                                : Colors.white70,
+                          ),
+                          const SizedBox(width: 14),
+                          Text(
+                            item['name'] as String,
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight:
+                                  isCurrent ? FontWeight.bold : FontWeight.w500,
+                              color: isCurrent
+                                  ? const Color(0xFFD4AF37)
+                                  : Colors.white,
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            _formatTime(item['time'] as DateTime),
+                            style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              color: isCurrent
+                                  ? const Color(0xFFD4AF37)
+                                  : Colors.white,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                ],
+              );
+            }
+
+            Widget _buildQiblaAndTasbihTab() {
+              final qiblaAngle = Qibla(Coordinates(_lat, _lng)).direction;
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF12261F),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Column(
+                      children: [
+                        const Text(
+                          'اتجاه القبلة من موقعك',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFD4AF37),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        Transform.rotate(
+                          angle: qiblaAngle * (math.pi / 180),
+                          child: const Icon(
+                            Icons.navigation,
+                            size: 72,
+                            color: Color(0xFFD4AF37),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          '${qiblaAngle.toStringAsFixed(1)}° من الشمال الحقيقي',
+                          style: const TextStyle(fontSize: 16, color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Container(
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF12261F),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Column(
+                      children: [
+                        const Text(
+                          'السبحة الإلكترونية',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFD4AF37),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        DropdownButton<int>(
+                          value: _tasbihIndex,
+                          dropdownColor: const Color(0xFF12261F),
+                          items: List.generate(
+                            _tasbihList.length,
+                            (i) => DropdownMenuItem(
+                              value: i,
+                              child: Text(_tasbihList[i]),
+                            ),
+                          ),
+                          onChanged: (val) {
+                            if (val != null) {
+                              setState(() => _tasbihIndex = val);
+                            }
+                          },
+                        ),
+                        const SizedBox(height: 16),
+                        GestureDetector(
+                          onTap: () {
+                            setState(() => _tasbihCount++);
+                            _savePrefs();
+                          },
+                          child: Container(
+                            width: 140,
+                            height: 140,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: const Color(0xFF1B4332),
+                              border: Border.all(
+                                color: const Color(0xFFD4AF37),
+                                width: 3,
+                              ),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              '$_tasbihCount',
+                              style: const TextStyle(
+                                fontSize: 36,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        TextButton.icon(
+                          onPressed: () {
+                            setState(() => _tasbihCount = 0);
+                            _savePrefs();
+                          },
+                          icon: const Icon(Icons.refresh, color: Colors.white70),
+                          label: const Text('تصفير العداد',
+                              style: TextStyle(color: Colors.white70)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }
+
+            Widget _buildSettingsTab() {
+              return ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  SwitchListTile(
+                    title: const Text('تفعيل تنبيهات الأذان'),
+                    subtitle: const Text('إرسال إشعار وصوت تنبيه عند دخول وقت الصلاة'),
+                    value: _notificationsEnabled,
+                    activeColor: const Color(0xFFD4AF37),
+                    onChanged: (val) async {
+                      setState(() => _notificationsEnabled = val);
+                      await _savePrefs();
+                      _calculatePrayers();
+                    },
+                  ),
+                  const Divider(),
+                  ListTile(
+                    title: const Text('طريقة حساب المواقيت'),
+                    subtitle: const Text('اختر الهيئة الفلكية المناسبة لبلدك'),
+                    trailing: DropdownButton<String>(
+                      value: _methodKey,
+                      dropdownColor: const Color(0xFF12261F),
+                      items: const [
+                        DropdownMenuItem(
+                            value: 'egyptian',
+                            child: Text('الهيئة المصرية للمساحة')),
+                        DropdownMenuItem(
+                            value: 'umm_al_qura', child: Text('أم القرى (مكة)')),
+                        DropdownMenuItem(
+                            value: 'mwl', child: Text('رابطة العالم الإسلامي')),
+                        DropdownMenuItem(value: 'dubai', child: Text('دبي / الإمارات')),
+                      ],
+                      onChanged: (val) async {
+                        if (val != null) {
+                          setState(() => _methodKey = val);
+                          await _savePrefs();
+                          _calculatePrayers();
+                        }
+                      },
+                    ),
+                  ),
+                  const Divider(),
+                  ListTile(
+                    leading: const Icon(Icons.location_city, color: Color(0xFFD4AF37)),
+                    title: const Text('تحديد الموقع عبر GPS'),
+                    subtitle: Text(_locationName),
+                    onTap: _updateLocationGPS,
+                  ),
+                ],
+              );
+            }
+          }
+          EOF
+
+      - name: Build Release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Athan-App-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
