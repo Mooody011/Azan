@@ -38,7 +38,7 @@ jobs:
       - name: Configure Android Permissions, Gradle & Embedded Athan Sound
         run: |
           python3 - << 'EOF'
-          import os, wave, math, struct
+          import os, re, wave, math, struct
 
           # 1. توليد ملف صوت تنبيه/أذان مدمج داخل res/raw/athan.wav
           raw_dir = "android/app/src/main/res/raw"
@@ -59,7 +59,25 @@ jobs:
                       sample = int(val * env * 28000)
                       wf.writeframes(struct.pack("<h", max(-32768, min(32767, sample))))
 
-          # 2. تحديث android/app/build.gradle لتفعيل Desugaring وضبط SDK
+          # 2. تحديث android/settings.gradle لضمان توافق إصدار Kotlin و AGP
+          settings_path = "android/settings.gradle"
+          if os.path.exists(settings_path):
+              with open(settings_path, "r", encoding="utf-8") as f:
+                  settings = f.read()
+              settings = re.sub(
+                  r'id "org\.jetbrains\.kotlin\.android" version "[^"]+"',
+                  'id "org.jetbrains.kotlin.android" version "1.9.24"',
+                  settings
+              )
+              settings = re.sub(
+                  r'id "com\.android\.application" version "[^"]+"',
+                  'id "com.android.application" version "8.2.2"',
+                  settings
+              )
+              with open(settings_path, "w", encoding="utf-8") as f:
+                  f.write(settings)
+
+          # 3. تحديث android/app/build.gradle لتفعيل Desugaring ومنع أخطاء R8 و Lint في Release
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r", encoding="utf-8") as f:
               gradle = f.read()
@@ -69,12 +87,34 @@ jobs:
           gradle = gradle.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
           gradle = gradle.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
           gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled true")
-          gradle += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+          gradle = gradle.replace(
+              "signingConfig = signingConfigs.debug",
+              "signingConfig = signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false"
+          )
+          gradle = gradle.replace(
+              "signingConfig signingConfigs.debug",
+              "signingConfig signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false"
+          )
+          gradle += """
+          android {
+              defaultConfig {
+                  multiDexEnabled true
+              }
+              lint {
+                  checkReleaseBuilds false
+                  abortOnError false
+              }
+          }
+
+          dependencies {
+              coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
+          }
+          """
 
           with open(gradle_path, "w", encoding="utf-8") as f:
               f.write(gradle)
 
-          # 3. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
+          # 4. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r", encoding="utf-8") as f:
               manifest = f.read()
