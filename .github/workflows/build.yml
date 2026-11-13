@@ -33,12 +33,12 @@ jobs:
 
       - name: Add Dependencies
         run: |
-          flutter pub add adhan:^2.0.0+1 intl:^0.19.0 geolocator:^13.0.1 flutter_local_notifications:^17.2.3 timezone:^0.9.4 shared_preferences:^2.3.2
+          flutter pub add adhan:2.0.0+1 intl:0.19.0 geolocator:13.0.1 flutter_local_notifications:17.2.3 timezone:0.9.4 shared_preferences:2.3.2
 
       - name: Configure Android Permissions, Gradle & Embedded Athan Sound
         run: |
           python3 - << 'EOF'
-          import os, re, wave, math, struct
+          import os, wave, math, struct
 
           # 1. توليد ملف صوت تنبيه/أذان مدمج داخل res/raw/athan.wav
           raw_dir = "android/app/src/main/res/raw"
@@ -59,37 +59,24 @@ jobs:
                       sample = int(val * env * 28000)
                       wf.writeframes(struct.pack("<h", max(-32768, min(32767, sample))))
 
-          # 2. تحديث android/settings.gradle لضمان توافق إصدار Kotlin و AGP
-          settings_path = "android/settings.gradle"
-          if os.path.exists(settings_path):
-              with open(settings_path, "r", encoding="utf-8") as f:
-                  settings = f.read()
-              settings = re.sub(
-                  r'id "org\.jetbrains\.kotlin\.android" version "[^"]+"',
-                  'id "org.jetbrains.kotlin.android" version "1.9.24"',
-                  settings
-              )
-              settings = re.sub(
-                  r'id "com\.android\.application" version "[^"]+"',
-                  'id "com.android.application" version "8.2.2"',
-                  settings
-              )
-              with open(settings_path, "w", encoding="utf-8") as f:
-                  f.write(settings)
-
-          # 3. تحديث android/app/build.gradle لتفعيل Desugaring ومنع أخطاء R8 و Lint في Release
+          # 2. تحديث android/app/build.gradle لتوافق Java 17 و SDK 35 و Desugaring
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r", encoding="utf-8") as f:
               gradle = f.read()
 
-          gradle = gradle.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 34")
-          gradle = gradle.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 34")
+          gradle = gradle.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 35")
+          gradle = gradle.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 35")
           gradle = gradle.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
           gradle = gradle.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
-          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled true")
+          gradle = gradle.replace("targetSdk = flutter.targetSdkVersion", "targetSdk = 34")
+          gradle = gradle.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 34")
+          gradle = gradle.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
+          gradle = gradle.replace("jvmTarget = '1.8'", "jvmTarget = '17'")
+          gradle = gradle.replace('jvmTarget = "1.8"', 'jvmTarget = "17"')
+          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled = true")
           gradle = gradle.replace(
               "signingConfig = signingConfigs.debug",
-              "signingConfig = signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false"
+              "signingConfig = signingConfigs.debug\n            minifyEnabled = false\n            shrinkResources = false"
           )
           gradle = gradle.replace(
               "signingConfig signingConfigs.debug",
@@ -98,23 +85,23 @@ jobs:
           gradle += """
           android {
               defaultConfig {
-                  multiDexEnabled true
+                  multiDexEnabled = true
               }
               lint {
-                  checkReleaseBuilds false
-                  abortOnError false
+                  checkReleaseBuilds = false
+                  abortOnError = false
               }
           }
 
           dependencies {
-              coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
+              coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
           }
           """
 
           with open(gradle_path, "w", encoding="utf-8") as f:
               f.write(gradle)
 
-          # 4. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
+          # 3. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r", encoding="utf-8") as f:
               manifest = f.read()
@@ -872,7 +859,9 @@ jobs:
           EOF
 
       - name: Build Release APK
-        run: flutter build apk --release
+        run: |
+          flutter analyze --no-fatal-infos
+          flutter build apk --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
