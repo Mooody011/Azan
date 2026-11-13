@@ -30,6 +30,7 @@ jobs:
         run: |
           rm -rf android ios lib test pubspec.yaml pubspec.lock
           flutter create --org com.mohamed.athan --project-name athan_app .
+          rm -rf test
 
       - name: Add Dependencies
         run: |
@@ -59,7 +60,7 @@ jobs:
                       sample = int(val * env * 28000)
                       wf.writeframes(struct.pack("<h", max(-32768, min(32767, sample))))
 
-          # 2. تحديث android/app/build.gradle لتوافق Java 17 و SDK 35 و Desugaring
+          # 2. تحديث android/app/build.gradle لإعداد SDK 35 و Desugaring ومنع أخطاء R8
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r", encoding="utf-8") as f:
               gradle = f.read()
@@ -70,13 +71,10 @@ jobs:
           gradle = gradle.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
           gradle = gradle.replace("targetSdk = flutter.targetSdkVersion", "targetSdk = 34")
           gradle = gradle.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 34")
-          gradle = gradle.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
-          gradle = gradle.replace("jvmTarget = '1.8'", "jvmTarget = '17'")
-          gradle = gradle.replace('jvmTarget = "1.8"', 'jvmTarget = "17"')
-          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled = true")
+          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled true")
           gradle = gradle.replace(
               "signingConfig = signingConfigs.debug",
-              "signingConfig = signingConfigs.debug\n            minifyEnabled = false\n            shrinkResources = false"
+              "signingConfig = signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false"
           )
           gradle = gradle.replace(
               "signingConfig signingConfigs.debug",
@@ -85,16 +83,16 @@ jobs:
           gradle += """
           android {
               defaultConfig {
-                  multiDexEnabled = true
+                  multiDexEnabled true
               }
               lint {
-                  checkReleaseBuilds = false
-                  abortOnError = false
+                  checkReleaseBuilds false
+                  abortOnError false
               }
           }
 
           dependencies {
-              coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
+              coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'
           }
           """
 
