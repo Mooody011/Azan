@@ -39,7 +39,7 @@ jobs:
       - name: Configure Android Permissions, Gradle & Embedded Athan Sound
         run: |
           python3 - << 'EOF'
-          import os, wave, math, struct
+          import os, re, wave, math, struct
 
           # 1. توليد ملف صوت تنبيه/أذان مدمج داخل res/raw/athan.wav
           raw_dir = "android/app/src/main/res/raw"
@@ -60,21 +60,54 @@ jobs:
                       sample = int(val * env * 28000)
                       wf.writeframes(struct.pack("<h", max(-32768, min(32767, sample))))
 
-          # 2. تحديث android/app/build.gradle لإعداد SDK 35 و Desugaring ومنع أخطاء R8
+          # 2. تحديث Gradle Wrapper و settings.gradle لدعم Kotlin 1.9.24 المطلوب للمكتبات الحديثة
+          wrapper_path = "android/gradle/wrapper/gradle-wrapper.properties"
+          if os.path.exists(wrapper_path):
+              with open(wrapper_path, "r", encoding="utf-8") as f:
+                  wrapper = f.read()
+              wrapper = re.sub(
+                  r'distributionUrl=.*',
+                  r'distributionUrl=https\://services.gradle.org/distributions/gradle-8.4-all.zip',
+                  wrapper
+              )
+              with open(wrapper_path, "w", encoding="utf-8") as f:
+                  f.write(wrapper)
+
+          settings_path = "android/settings.gradle"
+          if os.path.exists(settings_path):
+              with open(settings_path, "r", encoding="utf-8") as f:
+                  settings = f.read()
+              settings = re.sub(
+                  r'id\s+["\']com\.android\.application["\']\s+version\s+["\'][^"\']+["\']',
+                  'id "com.android.application" version "8.2.2"',
+                  settings
+              )
+              settings = re.sub(
+                  r'id\s+["\']org\.jetbrains\.kotlin\.android["\']\s+version\s+["\'][^"\']+["\']',
+                  'id "org.jetbrains.kotlin.android" version "1.9.24"',
+                  settings
+              )
+              with open(settings_path, "w", encoding="utf-8") as f:
+                  f.write(settings)
+
+          # 3. تحديث android/app/build.gradle وتوحيد Java 17 و SDK 34 و Desugaring
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r", encoding="utf-8") as f:
               gradle = f.read()
 
-          gradle = gradle.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 35")
-          gradle = gradle.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 35")
+          gradle = gradle.replace("compileSdk = flutter.compileSdkVersion", "compileSdk = 34")
+          gradle = gradle.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 34")
           gradle = gradle.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
           gradle = gradle.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
           gradle = gradle.replace("targetSdk = flutter.targetSdkVersion", "targetSdk = 34")
           gradle = gradle.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 34")
-          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled true")
+          gradle = gradle.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
+          gradle = gradle.replace("jvmTarget = '1.8'", "jvmTarget = '17'")
+          gradle = gradle.replace('jvmTarget = "1.8"', 'jvmTarget = "17"')
+          gradle = gradle.replace("compileOptions {", "compileOptions {\n        coreLibraryDesugaringEnabled = true")
           gradle = gradle.replace(
               "signingConfig = signingConfigs.debug",
-              "signingConfig = signingConfigs.debug\n            minifyEnabled false\n            shrinkResources false"
+              "signingConfig = signingConfigs.debug\n            minifyEnabled = false\n            shrinkResources = false"
           )
           gradle = gradle.replace(
               "signingConfig signingConfigs.debug",
@@ -83,11 +116,11 @@ jobs:
           gradle += """
           android {
               defaultConfig {
-                  multiDexEnabled true
+                  multiDexEnabled = true
               }
               lint {
-                  checkReleaseBuilds false
-                  abortOnError false
+                  checkReleaseBuilds = false
+                  abortOnError = false
               }
           }
 
@@ -99,7 +132,7 @@ jobs:
           with open(gradle_path, "w", encoding="utf-8") as f:
               f.write(gradle)
 
-          # 3. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
+          # 4. تحديث AndroidManifest.xml بالصلاحيات ومستقبلات الإشعارات
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r", encoding="utf-8") as f:
               manifest = f.read()
@@ -859,7 +892,7 @@ jobs:
       - name: Build Release APK
         run: |
           flutter analyze --no-fatal-infos
-          flutter build apk --release
+          flutter build apk --release --verbose || (echo "=== BUILD ERROR DETAILS ===" && exit 1)
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
